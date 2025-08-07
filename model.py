@@ -20,6 +20,7 @@ class Config:
     n_u: int = 1
     n_y: int = 1
     n_x: int = 5
+    n_hidden: int = 32
     dropout: float = 0.0
     bias: bool = False  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     device_name: str = "cpu"
@@ -78,7 +79,7 @@ def dlsim2(A, B, C, D, u, x= None):
         
 
 class WHModel(nn.Module):
-    def __init__(self, state_dim=5, input_dim=1, output_dim=1, hidden_dim=29):
+    def __init__(self, state_dim=5, input_dim=1, output_dim=1, hidden_dim=32):
         super().__init__()
         # Example for G1
         self.A1 = nn.Parameter(torch.randn(state_dim, state_dim))
@@ -86,15 +87,15 @@ class WHModel(nn.Module):
         self.C1 = nn.Parameter(torch.randn(output_dim, state_dim))
         self.D1 = nn.Parameter(torch.randn(output_dim, input_dim))
         # Example for static nonlinearity
-        # self.w1 = nn.Parameter(torch.randn(input_dim, hidden_dim))
-        # self.b1 = nn.Parameter(torch.randn(1,hidden_dim))
-        # self.w2 = nn.Parameter(torch.randn(hidden_dim, output_dim))
-        # self.b2 = nn.Parameter(torch.randn(1,output_dim))
+        self.w1 = nn.Parameter(torch.randn(input_dim, hidden_dim))
+        self.b1 = nn.Parameter(torch.randn(1,hidden_dim))
+        self.w2 = nn.Parameter(torch.randn(hidden_dim, output_dim))
+        self.b2 = nn.Parameter(torch.randn(1,output_dim))
         # # Example for G2
-        # self.A2 = nn.Parameter(torch.randn(state_dim, state_dim))
-        # self.B2 = nn.Parameter(torch.randn(state_dim, input_dim))
-        # self.C2 = nn.Parameter(torch.randn(output_dim, state_dim))
-        # self.D2 = nn.Parameter(torch.randn(output_dim, input_dim))
+        self.A2 = nn.Parameter(torch.randn(state_dim, state_dim))
+        self.B2 = nn.Parameter(torch.randn(state_dim, input_dim))
+        self.C2 = nn.Parameter(torch.randn(output_dim, state_dim))
+        self.D2 = nn.Parameter(torch.randn(output_dim, input_dim))
 
 
     def forward(self, input_signal, initial_state1=None,initial_state2=None):
@@ -119,25 +120,25 @@ class WHModel(nn.Module):
             output_seq_G1 = g1_single(self.A1, self.B1, self.C1, self.D1, input_signal.double(),initial_state1)  # (batch_size, seq_len, 1)
         else:
             output_seq_G1 = g1_single(self.A1, self.B1, self.C1, self.D1, input_signal.double())
-        # def mlp_single(x, w1, b1, w2, b2):
-        #     # x: (seq_len, 1)
-        #     out = torch.matmul(x, w1) + b1  # (seq_len, hidden_dim)
-        #     out = F.relu(out)
-        #     out = torch.matmul(out, w2) + b2  # (seq_len, 1)
-        #     return out
+        def mlp_single(x, w1, b1, w2, b2):
+            # x: (seq_len, 1)
+            out = torch.matmul(x, w1) + b1  # (seq_len, hidden_dim)
+            out = F.relu(out)
+            out = torch.matmul(out, w2) + b2  # (seq_len, 1)
+            return out
 
-        # output_seq_F_processed = mlp_single(output_seq_G1, self.w1, self.b1, self.w2, self.b2)  # (batch_size, seq_len, 1)
+        output_seq_F_processed = mlp_single(output_seq_G1, self.w1, self.b1, self.w2, self.b2)  # (batch_size, seq_len, 1)
 
         # # --- G2 simulation (vectorized over batch) ---
-        # def g2_single(A, B, C, D, u,initial_state=None):
-        #     y = dlsim(A, B, C, D, u,initial_state)
-        #     # y = (y - y.mean(dim=0)) / (y.std(dim=0) + 1e-6)
-        #     return y
+        def g2_single(A, B, C, D, u,initial_state=None):
+            y = dlsim2(A, B, C, D, u,initial_state)
+            # y = (y - y.mean(dim=0)) / (y.std(dim=0) + 1e-6)
+            return y
 
-        # final_output = g2_single(self.A2, self.B2, self.C2, self.D2, output_seq_F_processed,initial_state2)  # (batch_size, seq_len, 1)
+        final_output = g2_single(self.A2, self.B2, self.C2, self.D2, output_seq_F_processed)  # (batch_size, seq_len, 1)
         # output_seq_G1 = (output_seq_G1 - output_seq_G1.mean(axis=0)[:, None]) / (output_seq_G1.std(axis=0)[:, None] + 1e-6)
         
-        return output_seq_G1
+        return final_output
 
 def unflatten_like(flat_tensor_batch: torch.Tensor, model: torch.nn.Module):
     """
@@ -254,7 +255,7 @@ class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, n_head, dropout=0.0, bias=False):
         super().__init__()
         self.ln_1 = LayerNorm(d_model, bias=bias)
-        self.self_attn = SelfAttention(d_model, n_head, dropout=dropout, causal=False, bias=bias) # encoder is never causal
+        self.self_attn = SelfAttention(d_model, n_head, dropout=dropout, causal=True, bias=bias) # encoder is never causal
         
         self.ln_2 = LayerNorm(d_model, bias=bias)
         self.mlp = MLP(d_model)
@@ -263,7 +264,40 @@ class TransformerEncoderLayer(nn.Module):
         x = x + self.self_attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+def check_params_for_fused(optim_groups):
+    incompatible_params = []
+    for group_idx, group in enumerate(optim_groups):
+        for p_idx, p in enumerate(group['params']):
+            # Check if floating point
+            is_float = p.dtype.is_floating_point
+            # Check if on supported device
+            is_on_supported_device = p.device.type in ['cuda', 'xpu', 'privateuseone']
 
+            if not is_float or not is_on_supported_device:
+                incompatible_params.append((
+                    group_idx, p_idx, p.shape, p.dtype, p.device
+                ))
+
+    if incompatible_params:
+        print("Found parameters incompatible with fused=True:")
+        for g_i, p_i, shape, dtype, device in incompatible_params:
+            print(f"  Group {g_i}, Param {p_i}, shape={shape}, dtype={dtype}, device={device}")
+    else:
+        print("All parameters are compatible with fused=True optimizer.")
+
+
+class AttentionPooling(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.q = nn.Parameter(torch.randn(d_model))  # learnable query
+
+    def forward(self, x):  # x: (batch, seq_len, d_model)
+        # Compute attention scores
+        # (batch, seq_len, d_model) * (d_model,) -> (batch, seq_len)
+        scores = torch.matmul(x, self.q)
+        alpha = F.softmax(scores, dim=1)            # (batch, seq_len)
+        pooled = torch.sum(x * alpha.unsqueeze(-1), dim=1)
+        return pooled  # (batch, d_model)
 
 
 class TransformerEncoder(nn.Module):
@@ -275,18 +309,21 @@ class TransformerEncoder(nn.Module):
             [TransformerEncoderLayer(config.d_model, config.n_head, config.dropout, config.bias) for _ in range(config.n_layers)]
         )
         self.ln_f = LayerNorm(config.d_model, config.bias)
-        self.param_projection = nn.Linear(config.d_model, config.d_model)
+        # self.attention_pool = AttentionPooling(config.d_model)
+        total_params =2*(config.n_x*config.n_x + config.n_x*config.n_u + config.n_y*config.n_x + config.n_y*config.n_u) + 3*config.n_hidden + 1
+        # self.param_projection = nn.Linear(config.d_model, total_params)
+        
 
-        self.mlp1 = nn.Sequential(
-            nn.Linear(config.n_u+config.n_y, 64),
+        self.mlp_param = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
             nn.ReLU(),
-            nn.Linear(64, config.n_x)
+            nn.Linear(config.d_model, total_params)
         )
 
-        # self.mlp2 = nn.Sequential(
+        # self.mlp1 = nn.Sequential(
         #     nn.Linear(config.n_u+config.n_y, 64),
         #     nn.ReLU(),
-        #     nn.Linear(64, config.n_x)
+        #     nn.Linear(64, config.d_model)
         # )
         # self.margin_head = nn.Linear(d_model, 1)
         # self.margin_head2 = nn.Linear(d_model, 1)
@@ -296,7 +333,7 @@ class TransformerEncoder(nn.Module):
         # y = (y - y.mean(axis=1)[:, None]) / (y.std(axis=1)[:, None] + 1e-6)
         inp = torch.cat((y,u.float()), dim = -1).float()
         
-        x0_1 = self.mlp1(inp).mean(dim = 1).unsqueeze(-1)
+        # x0_1 = self.mlp1(inp).mean(dim = 1).unsqueeze(-1)
         # x0_2 = self.mlp2(inp).mean(dim = 1).unsqueeze(-1)
         # print(x0_1.shape)
         tok = self.encoder_wte_noRNN(inp)
@@ -304,20 +341,55 @@ class TransformerEncoder(nn.Module):
         for block in self.blocks:
             x = block(x)
         x = self.ln_f(x)  # final layer normalization
-        pooled_transformer_output = x.mean(dim=1) # (d_model), you don't want info for each context step
-        parameters = self.param_projection(pooled_transformer_output)
+        # print(x.shape)
+        pooled_transformer_output = x.mean(dim=1)#self.attention_pool(x)# # (d_model), you don't want info for each context step
+        parameters = self.mlp_param(pooled_transformer_output)
         # print("Transformer pooled output:", pooled_transformer_output.mean().item(), pooled_transformer_output.std().item())
         # print("Projected param vector:", parameters.mean().item(), parameters.std().item())
 
         # margin_pred = self.margin_head(parameters).squeeze(-1)
         # margin_pred2 = self.margin_head2(parameters).squeeze(-1)
         # encoded = self.param_projection(parameters)
-        bounded = torch.tanh(parameters) * 0.01
+        # bounded = torch.tanh(parameters) * 0.5
         # print(bounded)
-        # wh_parameters = unflatten_like(bounded,wh)
+        wh_parameters = unflatten_like(parameters,wh)
+        skip = False
         # min_margin = mag_range[0]
-        wh_parameters = par
+        # wh_parameters = par
+        # eigvals_A1 = torch.linalg.eigvals(wh_parameters['A1'])
+        # max_A1,_ = eigvals_A1.abs().max(dim=1)
+        # print(max_A1)
+        # penalty = 0# ((max_A1 - 0.9).relu() ** 2).mean()
+        # print(wh_parameters['A1'].dtype)
+        # eigenvalues, eigenvectors = torch.linalg.eig(wh_parameters['A1'])
+        # tanh_eigenvalues = torch.tanh(eigenvalues)
+        # Lambda_tanh = torch.diag_embed(tanh_eigenvalues)
+        # wh_parameters['A1'] = (eigenvectors @ Lambda_tanh @ eigenvectors.transpose(-2, -1))#.real
+        if torch.isnan(wh_parameters['A1']).any() or torch.isnan(wh_parameters['A2']).any():
+            skip = True
+            # continue
+        else:
+            eigenvalues, eigenvectors = torch.linalg.eig(wh_parameters['A1'])
+            tanh_eigenvalues = torch.tanh(eigenvalues.abs())*eigenvalues/eigenvalues.abs()
+            Lambda_tanh = torch.diag_embed(tanh_eigenvalues)
+            wh_parameters['A1'] = (eigenvectors @ Lambda_tanh @ torch.linalg.inv(eigenvectors)).real
+
+
+            eigenvalues, eigenvectors = torch.linalg.eig(wh_parameters['A2'])
+            tanh_eigenvalues = torch.tanh(eigenvalues.abs())*eigenvalues/eigenvalues.abs()
+            Lambda_tanh = torch.diag_embed(tanh_eigenvalues)
+            wh_parameters['A2'] = (eigenvectors @ Lambda_tanh @ torch.linalg.inv(eigenvectors)).real
+        # print(wh_parameters['A1'].dtype)
+
         
+        # eigvals_A1 = torch.linalg.eigvals(wh_parameters['A1'])      # shape: (n,) or (batch, n)
+        # For *magnitude* constraint: penalize any eigenvalue with modulus < 0.5
+        # max_A1, _ = eigvals_A1.abs().max(dim=1)  # (batch_size,)
+        # penalties1 = (0.5 - eigvals_A1.abs()).relu()
+        # penalties2 = (eigvals_A1.abs()-1).relu()
+        # Optionally, sum or mean across batch and eigenvalues:
+        eigen_penalty = 0#penalties2.mean()
+
         # margin_pred should be of shape (batch_size,) and is a learnable output
         # alpha1 = min_margin + (mag_range[1] - min_margin) * torch.sigmoid(margin_pred)  # shape: (batch_size,)
         # alpha2 = min_margin + (mag_range[1] - min_margin) * torch.sigmoid(margin_pred2)  # shape: (batch_size,)
@@ -328,9 +400,9 @@ class TransformerEncoder(nn.Module):
         # # eigvals_A2 = torch.linalg.eigvals(wh_parameters['A2'])  # (batch_size, n)
         # max_A1, _ = eigvals_A1.abs().max(dim=1)  # (batch_size,)
         # # max_A2, _ = eigvals_A2.abs().max(dim=1)  # (batch_size,)
-
+        # vec_09 = (torch.ones((max_A1.shape[0],))*0.9).to(device = wh_parameters['A1'].device)
         # # # Rescale so the largest eigenvalue modulus is alpha for each batch
-        # wh_parameters['A1'] = wh_parameters['A1'] / max_A1[:, None, None]# * alpha1[:, None, None]
+        # wh_parameters['A1'] = (wh_parameters['A1'] / max_A1[:, None, None])*vec_09[:, None, None]# * alpha1[:, None, None]
         # for k, v in wh_parameters.items():
         #     print(f"{k}: shape {v.shape}, mean {v.mean().item():.4f}, std {v.std().item():.4f}")
 
@@ -343,7 +415,7 @@ class TransformerEncoder(nn.Module):
         # max_A2_new, _ = eigvals_A2_new.abs().max(dim=1)
         # print("Spectral radius after scaling:", max_A1_new, max_A2_new)
         
-        return wh_parameters, x0_1
+        return wh_parameters, eigen_penalty, skip
     
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
@@ -373,6 +445,7 @@ class TransformerEncoder(nn.Module):
         fused_available = True #'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
+        # print(optim_groups)
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
